@@ -911,6 +911,12 @@ typedef struct _RTP_VIDEO_STATS {
     uint32_t packetCountOOS;           // out-of-sequence packets
     uint32_t packetCountInvalid;       // corrupted packets, etc
     uint32_t packetCountFecInvalid;    // invalid FEC packet
+
+    // Everything that arrived on the video socket, including FEC, duplicates, and
+    // packets of frames that are later dropped. UDP payload bytes, so RTP headers are
+    // included but not UDP/IP. Both wrap around: take differences as uint32_t.
+    uint32_t packetCountReceived;
+    uint32_t byteCountReceived;
 } RTP_VIDEO_STATS, *PRTP_VIDEO_STATS;
 
 const RTP_VIDEO_STATS* LiGetRTPVideoStats(void);
