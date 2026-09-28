@@ -159,6 +159,11 @@ static void VideoReceiveThreadProc(void* context) {
             continue;
         }
 
+        // Every packet counts, including FEC, duplicates, and packets of frames that are
+        // later dropped
+        rtpQueue.stats.byteCountReceived += (uint32_t)err;
+        rtpQueue.stats.packetCountReceived++;
+
         if (!receivedDataFromPeer) {
             receivedDataFromPeer = true;
             Limelog("Received first video packet after %d ms\n", waitingForVideoMs);
