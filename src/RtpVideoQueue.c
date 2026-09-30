@@ -537,6 +537,57 @@ static void submitCompletedFrame(PRTP_VIDEO_QUEUE queue) {
     }
 }
 
+// When the current frame can't be completed, hands what arrived of it to the depacketizer as a
+// partial frame, if the renderer takes them (see CAPABILITY_PARTIAL_FRAMES). Returns true if it
+// did, having emptied both FEC block lists.
+static bool submitPartialFrame(PRTP_VIDEO_QUEUE queue) {
+    if (!partialFramesEnabled()) {
+        return false;
+    }
+
+    // Earlier FEC blocks of the frame that were completed, then what arrived of the current one
+    unsigned int completedCount = queue->completedFecBlockList.count;
+    unsigned int pendingDataCount = queue->pendingFecBlockList.count != 0 ? queue->bufferDataPackets : 0;
+    unsigned int shardCount = completedCount + pendingDataCount;
+    if (shardCount == 0) {
+        return false;
+    }
+
+    PRTPV_QUEUE_ENTRY* shards = calloc(shardCount, sizeof(*shards));
+    if (shards == NULL) {
+        return false;
+    }
+
+    unsigned int i = 0;
+    while (queue->completedFecBlockList.head != NULL) {
+        PRTPV_QUEUE_ENTRY entry = queue->completedFecBlockList.head;
+        removeEntryFromList(&queue->completedFecBlockList, entry);
+        shards[i++] = entry;
+    }
+    uint64_t receiveTimeUs = completedCount != 0 ? shards[0]->receiveTimeUs : queue->bufferFirstRecvTimeUs;
+
+    // The current block's data packets by their place in it, leaving gaps for lost ones
+    while (queue->pendingFecBlockList.head != NULL) {
+        PRTPV_QUEUE_ENTRY entry = queue->pendingFecBlockList.head;
+        removeEntryFromList(&queue->pendingFecBlockList, entry);
+
+        unsigned int index = U16(entry->packet->sequenceNumber - queue->bufferLowestSequenceNumber);
+        if (!entry->isParity && index < pendingDataCount && shards[completedCount + index] == NULL) {
+            shards[completedCount + index] = entry;
+        }
+        else {
+            free(entry->packet);
+        }
+    }
+
+    // Unless the current block is the frame's last, the rest of the frame never arrived
+    bool endsFrame = pendingDataCount != 0 && queue->multiFecCurrentBlockNumber == queue->multiFecLastBlockNumber;
+
+    queuePartialFrame(shards, shardCount, endsFrame, queue->currentFrameNumber, receiveTimeUs);
+    free(shards);
+    return true;
+}
+
 uint32_t RtpvGetCurrentFrameNumber(PRTP_VIDEO_QUEUE queue) {
     return queue->currentFrameNumber;
 }
@@ -593,6 +644,14 @@ int RtpvAddPacket(PRTP_VIDEO_QUEUE queue, PRTP_PACKET packet, int length, PRTPV_
     // if we can't finish a frame before receiving the next one.
     if (queue->pendingFecBlockList.count == 0 || queue->currentFrameNumber != nvPacket->frameIndex ||
             queue->multiFecCurrentBlockNumber != fecCurrentBlockNumber) {
+        // The current frame can't be completed now. If it goes to the depacketizer as a partial
+        // frame, it isn't reported lost.
+        bool abandoningFrame = queue->pendingFecBlockList.count != 0 ||
+                (queue->completedFecBlockList.count != 0 &&
+                 (queue->currentFrameNumber != nvPacket->frameIndex || queue->multiFecCurrentBlockNumber != fecCurrentBlockNumber));
+        uint32_t partialFrameNumber = queue->currentFrameNumber;
+        bool submittedPartialFrame = false;
+
         if (queue->pendingFecBlockList.count != 0) {
             // Report the final status of the FEC queue before dropping this frame
             reportFinalFrameFecStatus(queue);
@@ -610,12 +669,14 @@ int RtpvAddPacket(PRTP_VIDEO_QUEUE queue, PRTP_PACKET packet, int length, PRTPV_
                 // we must manually advance the queue to the next frame. Parsing this
                 // frame further is not possible.
                 if (queue->currentFrameNumber == nvPacket->frameIndex) {
+                    submittedPartialFrame = submitPartialFrame(queue);
+
                     // Discard any unsubmitted buffers from the previous frame
                     purgeListEntries(&queue->pendingFecBlockList);
                     purgeListEntries(&queue->completedFecBlockList);
 
                     // Notify the host of the loss of this frame
-                    if (!queue->reportedLostFrame) {
+                    if (!queue->reportedLostFrame && !submittedPartialFrame) {
                         notifyFrameLost(queue->currentFrameNumber, false);
                     }
 
@@ -636,6 +697,11 @@ int RtpvAddPacket(PRTP_VIDEO_QUEUE queue, PRTP_PACKET packet, int length, PRTPV_
             }
         }
 
+        // Any other frame that can't be completed now
+        if (abandoningFrame && !submittedPartialFrame) {
+            submittedPartialFrame = submitPartialFrame(queue);
+        }
+
         // We must either start on the current FEC block number for the current frame,
         // or block 0 of a new frame.
         uint8_t expectedFecBlockNumber = (queue->currentFrameNumber == nvPacket->frameIndex ? queue->multiFecCurrentBlockNumber : 0);
@@ -653,7 +719,7 @@ int RtpvAddPacket(PRTP_VIDEO_QUEUE queue, PRTP_PACKET packet, int length, PRTPV_
             purgeListEntries(&queue->completedFecBlockList);
 
             // Notify the host of the loss of this frame
-            if (!queue->reportedLostFrame) {
+            if (!queue->reportedLostFrame && !(submittedPartialFrame && nvPacket->frameIndex == partialFrameNumber)) {
                 notifyFrameLost(nvPacket->frameIndex, false);
             }
 
@@ -683,7 +749,8 @@ int RtpvAddPacket(PRTP_VIDEO_QUEUE queue, PRTP_PACKET packet, int length, PRTPV_
 
             // If the frame immediately preceding this one was lost, we may have already
             // reported it using our speculative RFI logic. Don't report it again.
-            if (queue->currentFrameNumber + 1 != nvPacket->frameIndex || !queue->reportedLostFrame) {
+            if ((queue->currentFrameNumber + 1 != nvPacket->frameIndex || !queue->reportedLostFrame) &&
+                    !(submittedPartialFrame && nvPacket->frameIndex - 1 == partialFrameNumber)) {
                 // NB: We only have to notify for the most recent lost frame, since
                 // the depacketizer will report the RFI range starting at the last
                 // frame it saw.

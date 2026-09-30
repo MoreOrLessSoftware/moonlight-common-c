@@ -24,6 +24,7 @@ static uint64_t firstPacketPresentationTime;
 static uint32_t firstPacketRtpTimestamp;
 static bool dropStatePending;
 static bool idrFrameProcessed;
+static bool framePartial;
 
 #define DR_CLEANUP -1000
 
@@ -77,6 +78,7 @@ void initializeVideoDepacketizer(int pktSize) {
     lastPacketPayloadLength = 0;
     dropStatePending = false;
     idrFrameProcessed = false;
+    framePartial = false;
     strictIdrFrameWait = !isReferenceFrameInvalidationEnabled();
 }
 
@@ -216,8 +218,9 @@ void validateDecodeUnitForPlayback(PDECODE_UNIT decodeUnit) {
             LC_ASSERT_VT(decodeUnit->bufferList->next->next->next != NULL);
         }
         else if (NegotiatedVideoFormat & (VIDEO_FORMAT_MASK_AV1 | VIDEO_FORMAT_MASK_PYROWAVE)) {
-            // We don't parse the AV1 or PyroWave bitstreams
-            LC_ASSERT_VT(decodeUnit->bufferList->bufferType == BUFFER_TYPE_PICDATA);
+            // We don't parse the AV1 or PyroWave bitstreams. A partial frame may start with a gap.
+            LC_ASSERT_VT(decodeUnit->bufferList->bufferType == BUFFER_TYPE_PICDATA ||
+                         (decodeUnit->partialFrame && decodeUnit->bufferList->bufferType == BUFFER_TYPE_MISSING));
         }
         else {
             LC_ASSERT(false);
@@ -497,6 +500,7 @@ static void reassembleFrame(int frameNumber, bool frameIsLTR) {
             // If we start sending this state in the frame header, we can make it 100% accurate.
             qdu->decodeUnit.hdrActive = LiGetCurrentHostDisplayHdrMode();
             qdu->decodeUnit.colorspace = (uint8_t)(qdu->decodeUnit.hdrActive ? COLORSPACE_REC_2020 : StreamConfig.colorSpace);
+            qdu->decodeUnit.partialFrame = framePartial;
 
             // Invoke the key frame callback if needed
             if (nalChainHead->bufferType != BUFFER_TYPE_PICDATA || qdu->decodeUnit.frameType == FRAME_TYPE_IDR) {
@@ -539,8 +543,10 @@ static void reassembleFrame(int frameNumber, bool frameIsLTR) {
                 LiCompleteVideoFrame(qdu, VideoCallbacks.submitDecodeUnit(&qdu->decodeUnit));
             }
 
-            // Notify the control connection
-            connectionReceivedCompleteFrame(frameNumber, frameIsLTR);
+            // Notify the control connection. A partial frame wasn't received complete.
+            if (!framePartial) {
+                connectionReceivedCompleteFrame(frameNumber, frameIsLTR);
+            }
 
             // Clear frame drops
             consecutiveFrameDrops = 0;
@@ -1124,6 +1130,173 @@ static void processRtpPayload(PNV_VIDEO_PACKET videoPacket, int length,
 
         reassembleFrame(frameIndex, extraFlags & NV_VIDEO_PACKET_EXTRA_FLAG_LTR_FRAME);
     }
+}
+
+bool partialFramesEnabled(void) {
+    return (NegotiatedVideoFormat & VIDEO_FORMAT_MASK_PYROWAVE) &&
+           (VideoCallbacks.capabilities & CAPABILITY_PARTIAL_FRAMES);
+}
+
+// Adds a stretch of the frame that didn't arrive to the NAL chain
+static bool queueMissing(int length) {
+    PLENTRY_INTERNAL entry;
+
+    if (length <= 0) {
+        return true;
+    }
+
+    // Consecutive lost packets make one gap
+    if (nalChainTail != NULL && nalChainTail->bufferType == BUFFER_TYPE_MISSING) {
+        nalChainTail->length += length;
+        nalChainDataLength += length;
+        return true;
+    }
+
+    entry = (PLENTRY_INTERNAL)malloc(sizeof(*entry));
+    if (entry == NULL) {
+        return false;
+    }
+
+    entry->allocPtr = entry;
+    entry->entry.next = NULL;
+    entry->entry.data = NULL;
+    entry->entry.length = length;
+    entry->entry.bufferType = BUFFER_TYPE_MISSING;
+    nalChainDataLength += length;
+
+    if (nalChainTail == NULL) {
+        nalChainHead = nalChainTail = (PLENTRY)entry;
+    }
+    else {
+        nalChainTail->next = (PLENTRY)entry;
+        nalChainTail = nalChainTail->next;
+    }
+    return true;
+}
+
+// Called by the video RTP FEC queue with what arrived of a PyroWave frame it couldn't complete
+// (see CAPABILITY_PARTIAL_FRAMES). shards holds the frame's data packets in order, NULL for
+// each one lost, and endsFrame says whether the last of them is the frame's last packet. We
+// take ownership of every packet in shards.
+void queuePartialFrame(PRTPV_QUEUE_ENTRY* shards, unsigned int shardCount, bool endsFrame, uint32_t frameIndex,
+                       uint64_t receiveTimeUs) {
+    const int payloadSize = StreamConfig.packetSize - (int)sizeof(NV_VIDEO_PACKET);
+    uint16_t lastPayloadLength = 0;
+    bool haveTimestamps = false;
+    bool haveData = false;
+    bool ok = true;
+    unsigned int i;
+
+    // The FEC queue only gives us packets of whole frames, so we haven't seen any of this one.
+    // Sunshine's short frame header is 8 bytes, which is what a lost first packet held.
+    LC_ASSERT(!decodingFrame);
+    LC_ASSERT(nalChainHead == NULL);
+    uint32_t frameHeaderSize = 8;
+
+    if (decodingFrame || nalChainHead != NULL || isBefore32(frameIndex, nextFrameNumber)) {
+        ok = false;
+    }
+    else if (isBefore32(nextFrameNumber, frameIndex)) {
+        Limelog("Network dropped %d frames (frames %d to %d)\n",
+                frameIndex - nextFrameNumber, nextFrameNumber, frameIndex - 1);
+    }
+
+    frameHostProcessingLatency = 0;
+    firstPacketReceiveTimeUs = receiveTimeUs;
+
+    for (i = 0; i < shardCount; i++) {
+        PRTPV_QUEUE_ENTRY queueEntryPtr = shards[i];
+
+        if (queueEntryPtr == NULL) {
+            if (ok) {
+                ok = queueMissing(i == 0 ? payloadSize - (int)frameHeaderSize : payloadSize);
+            }
+            continue;
+        }
+
+        // The packet buffer holds the queue entry, which becomes the NAL chain entry, as in
+        // queueRtpPacket()
+        RTPV_QUEUE_ENTRY queueEntry = *queueEntryPtr;
+        PLENTRY_INTERNAL existingEntry = (PLENTRY_INTERNAL)queueEntryPtr;
+        existingEntry->allocPtr = queueEntry.packet;
+
+        int dataOffset = sizeof(*queueEntry.packet);
+        if (queueEntry.packet->header & FLAG_EXTENSION) {
+            dataOffset += 4; // 2 additional fields
+        }
+        PNV_VIDEO_PACKET nvPacket = (PNV_VIDEO_PACKET)(((char*)queueEntry.packet) + dataOffset);
+        char* data = (char*)(nvPacket + 1);
+        int offset = 0;
+        int length = queueEntry.length - dataOffset - (int)sizeof(*nvPacket);
+
+        if (!haveTimestamps) {
+            haveTimestamps = true;
+
+            // As in processRtpPayload()
+            if (!syntheticPtsBaseUs) {
+                syntheticPtsBaseUs = receiveTimeUs;
+            }
+            if (!queueEntry.presentationTimeUs && frameIndex > 0) {
+                firstPacketPresentationTime = receiveTimeUs - syntheticPtsBaseUs;
+            }
+            else {
+                firstPacketPresentationTime = queueEntry.presentationTimeUs;
+            }
+            firstPacketRtpTimestamp = queueEntry.rtpTimestamp;
+        }
+
+        if (i == 0 && length >= 8) {
+            // The frame header (see processRtpPayload()): host latency, and the length of the
+            // last packet's payload
+            BYTE_BUFFER bb;
+            BbInitializeWrappedBuffer(&bb, data, 1, 2, BYTE_ORDER_LITTLE);
+            BbGet16(&bb, &frameHostProcessingLatency);
+            BbInitializeWrappedBuffer(&bb, data, 4, 2, BYTE_ORDER_LITTLE);
+            BbGet16(&bb, &lastPayloadLength);
+            if (data[0] == (char)0x81) {
+                frameHeaderSize = 44;
+            }
+            offset = (int)frameHeaderSize;
+            length -= (int)frameHeaderSize;
+        }
+
+        // Trailing padding isn't part of the frame
+        if (endsFrame && i == shardCount - 1 && lastPayloadLength != 0) {
+            int valid = (int)lastPayloadLength - (i == 0 ? (int)frameHeaderSize : 0);
+            if (valid > 0 && valid <= length) {
+                length = valid;
+            }
+        }
+
+        if (ok && length > 0) {
+            queueFragment(&existingEntry, data, offset, length);
+            haveData = true;
+        }
+        if (existingEntry != NULL) {
+            free(existingEntry->allocPtr);
+        }
+    }
+
+    if (!ok || !haveData) {
+        cleanupFrameState();
+        return;
+    }
+
+    // PyroWave frames stand alone, so this one is as good a starting point as any
+    decodingFrame = false;
+    nextFrameNumber = frameIndex + 1;
+    frameType = FRAME_TYPE_IDR;
+    waitingForIdrFrame = false;
+    waitingForRefInvalFrame = false;
+    waitingForNextSuccessfulFrame = false;
+    dropStatePending = false;
+
+    framePartial = true;
+    reassembleFrame(frameIndex, false);
+    framePartial = false;
+
+    // In case the frame couldn't be queued
+    cleanupFrameState();
 }
 
 // Called by the video RTP FEC queue to notify us of a lost frame

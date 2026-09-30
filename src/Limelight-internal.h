@@ -131,6 +131,9 @@ int performRtspHandshake(PSERVER_INFORMATION serverInfo);
 void initializeVideoDepacketizer(int pktSize);
 void destroyVideoDepacketizer(void);
 void queueRtpPacket(PRTPV_QUEUE_ENTRY queueEntry);
+bool partialFramesEnabled(void);
+void queuePartialFrame(PRTPV_QUEUE_ENTRY* shards, unsigned int shardCount, bool endsFrame, uint32_t frameIndex,
+                       uint64_t receiveTimeUs);
 void stopVideoDepacketizer(void);
 void requestDecoderRefresh(void);
 void notifyFrameLost(unsigned int frameNumber, bool speculative);
