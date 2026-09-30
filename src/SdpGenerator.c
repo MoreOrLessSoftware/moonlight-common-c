@@ -433,6 +433,10 @@ static PSDP_OPTION getAttributesList(char*urlSafeAddr) {
 
         if (NegotiatedVideoFormat & VIDEO_FORMAT_MASK_PYROWAVE) {
             err |= addAttributeString(&optionHead, "x-nv-vqos[0].bitStreamFormat", "3");
+
+            // Record framing, which the nonary (vibeshine) host otherwise replaces with a
+            // length-prefixed framing we don't parse. This fork's Sunshine ignores it.
+            err |= addAttributeString(&optionHead, "x-ss-video[0].pyrowaveFeatures", "1");
         }
         else if (NegotiatedVideoFormat & VIDEO_FORMAT_MASK_AV1) {
             err |= addAttributeString(&optionHead, "x-nv-vqos[0].bitStreamFormat", "2");
@@ -534,7 +538,9 @@ static PSDP_OPTION getAttributesList(char*urlSafeAddr) {
     }
 
     if (AppVersionQuad[0] >= 7) {
-        snprintf(payloadStr, sizeof(payloadStr), "%d", (StreamConfig.colorSpace << 1) | StreamConfig.colorRange);
+        // PyroWave is decoded as full range, and PyroWave hosts encode the range we ask for
+        int colorRange = (NegotiatedVideoFormat & VIDEO_FORMAT_MASK_PYROWAVE) ? COLOR_RANGE_FULL : StreamConfig.colorRange;
+        snprintf(payloadStr, sizeof(payloadStr), "%d", (StreamConfig.colorSpace << 1) | colorRange);
         err |= addAttributeString(&optionHead, "x-nv-video[0].encoderCscMode", payloadStr);
     }
 
