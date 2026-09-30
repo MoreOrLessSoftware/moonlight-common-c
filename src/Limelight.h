@@ -532,14 +532,18 @@ void LiInitializeConnectionCallbacks(PCONNECTION_LISTENER_CALLBACKS clCallbacks)
 #define SCM_HEVC_REXT10_444 0x00100000 // Sunshine extension
 #define SCM_AV1_HIGH8_444   0x00200000 // Sunshine extension
 #define SCM_AV1_HIGH10_444  0x00400000 // Sunshine extension
-#define SCM_PYROWAVE        0x01000000 // Sunshine extension (this fork)
-#define SCM_PYROWAVE_10BIT  0x02000000 // Sunshine extension (this fork)
+// PyroWave bits as the Aurora, Solarflare and nonary (vibeshine) hosts define them. Only
+// 4:2:0 streams are negotiated.
+#define SCM_PYROWAVE           0x00800000 // Sunshine extension
+#define SCM_PYROWAVE_444       0x01000000 // Sunshine extension
+#define SCM_PYROWAVE_10BIT     0x02000000 // Sunshine extension
+#define SCM_PYROWAVE_10BIT_444 0x04000000 // Sunshine extension
 
 // SCM masks to identify various codec capabilities
 #define SCM_MASK_H264     (SCM_H264 | SCM_H264_HIGH8_444)
 #define SCM_MASK_HEVC     (SCM_HEVC | SCM_HEVC_MAIN10 | SCM_HEVC_REXT8_444 | SCM_HEVC_REXT10_444)
 #define SCM_MASK_AV1      (SCM_AV1_MAIN8 | SCM_AV1_MAIN10 | SCM_AV1_HIGH8_444 | SCM_AV1_HIGH10_444)
-#define SCM_MASK_PYROWAVE (SCM_PYROWAVE | SCM_PYROWAVE_10BIT)
+#define SCM_MASK_PYROWAVE (SCM_PYROWAVE | SCM_PYROWAVE_444 | SCM_PYROWAVE_10BIT | SCM_PYROWAVE_10BIT_444)
 #define SCM_MASK_10BIT    (SCM_HEVC_MAIN10 | SCM_HEVC_REXT10_444 | SCM_AV1_MAIN10 | SCM_AV1_HIGH10_444 | SCM_PYROWAVE_10BIT)
 #define SCM_MASK_YUV444 (SCM_H264_HIGH8_444 | SCM_HEVC_REXT8_444 | SCM_HEVC_REXT10_444 | SCM_AV1_HIGH8_444 | SCM_AV1_HIGH10_444)
 
@@ -1033,6 +1037,13 @@ typedef struct _SS_HDR_METADATA {
 // from the host PC's monitor and content (if available). It is only valid to call this
 // function when HDR mode is active on the host. This is a Sunshine protocol extension.
 bool LiGetHdrMetadata(PSS_HDR_METADATA metadata);
+
+// Returns the PyroWave bitstream revision the host advertised in its RTSP DESCRIBE response
+// (x-ss-pyrowave.bitstream), or an empty string if it sent none. The nonary (vibeshine) host
+// sends it; this fork's Sunshine doesn't. Hosts that send it pack PyroWave frames in record
+// framing: blocks in any order, padding records between them, and 4:2:0 chroma sited at the
+// center. Valid after the RTSP handshake. This is a Sunshine protocol extension.
+const char* LiGetHostPyroWaveBitstreamId(void);
 
 // This function requests an IDR frame from the host. Typically this is done using DR_NEED_IDR, but clients
 // processing frames asynchronously may need to reset their decoder state even after returning DR_OK for

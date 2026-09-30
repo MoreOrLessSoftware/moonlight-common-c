@@ -20,6 +20,9 @@ static PPLT_CRYPTO_CONTEXT encryptionCtx;
 static PPLT_CRYPTO_CONTEXT decryptionCtx;
 static uint32_t encryptionSequenceNumber;
 
+// PyroWave bitstream revision from the DESCRIBE response ("" when absent)
+static char hostPyroWaveBitstreamId[32];
+
 static SOCKET sock = INVALID_SOCKET;
 static ENetHost* client;
 static ENetPeer* peer;
@@ -900,6 +903,33 @@ static bool parseUrlAddrFromRtspUrlString(const char* rtspUrlString, char* desti
     return true;
 }
 
+// Copies a token-valued SDP attribute (up to whitespace) into val
+static bool parseSdpAttributeToToken(const char* payload, const char* name, char* val, size_t valSize) {
+    const char* attribute = strstr(payload, name);
+    if (!attribute || valSize == 0) {
+        return false;
+    }
+
+    const char* valst = strstr(attribute, ":");
+    if (!valst) {
+        return false;
+    }
+    valst++;
+
+    size_t len = 0;
+    while (valst[len] != '\0' && valst[len] != '\r' && valst[len] != '\n' &&
+           valst[len] != ' ' && len + 1 < valSize) {
+        val[len] = valst[len];
+        len++;
+    }
+    val[len] = '\0';
+    return len != 0;
+}
+
+const char* LiGetHostPyroWaveBitstreamId(void) {
+    return hostPyroWaveBitstreamId;
+}
+
 // SDP attributes are in the form:
 // a=x-nv-bwe.bwuSafeZoneLowLimit:70\r\n
 bool parseSdpAttributeToUInt(const char* payload, const char* name, uint32_t* val) {
@@ -1086,6 +1116,10 @@ int performRtspHandshake(PSERVER_INFORMATION serverInfo) {
             ret = -1;
             goto Exit;
         }
+
+        hostPyroWaveBitstreamId[0] = '\0';
+        parseSdpAttributeToToken(response.payload, "x-ss-pyrowave.bitstream",
+                                 hostPyroWaveBitstreamId, sizeof(hostPyroWaveBitstreamId));
 
         if ((StreamConfig.supportedVideoFormats & VIDEO_FORMAT_MASK_PYROWAVE) && strstr(response.payload, "PYROWAVE/90000")) {
             if ((serverInfo->serverCodecModeSupport & SCM_PYROWAVE_10BIT) && (StreamConfig.supportedVideoFormats & VIDEO_FORMAT_PYROWAVE_10BIT)) {
