@@ -113,11 +113,15 @@ void LiInitializeStreamConfiguration(PSTREAM_CONFIGURATION streamConfig);
 #define BUFFER_TYPE_PPS      0x02
 #define BUFFER_TYPE_VPS      0x03
 
+// Only in partial frames (see CAPABILITY_PARTIAL_FRAMES): length bytes of the frame that didn't
+// arrive. The entry's data is NULL.
+#define BUFFER_TYPE_MISSING  0x04
+
 typedef struct _LENTRY {
     // Pointer to the next entry or NULL if this is the last entry
     struct _LENTRY* next;
 
-    // Pointer to data (never NULL)
+    // Pointer to data (never NULL, except for BUFFER_TYPE_MISSING)
     char* data;
 
     // Size of data in bytes (never <= 0)
@@ -191,6 +195,11 @@ typedef struct _DECODE_UNIT {
     // Note: This is not currently parsed from the actual bitstream, so if your
     // client has access to a bitstream parser, prefer that over this field.
     uint8_t colorspace;
+
+    // Some of this frame's packets were lost (see CAPABILITY_PARTIAL_FRAMES). The buffer
+    // chain holds what arrived, in frame order, with BUFFER_TYPE_MISSING entries for the rest.
+    // The data after the last entry may also be missing.
+    bool partialFrame;
 } DECODE_UNIT, *PDECODE_UNIT;
 
 // Specifies that the audio stream should be encoded in stereo (default)
@@ -278,6 +287,13 @@ typedef struct _DECODE_UNIT {
 // If set in the video renderer capabilities field, this flag specifies that the renderer
 // supports reference frame invalidation for AV1 streams. This flag is only valid on video renderers.
 #define CAPABILITY_REFERENCE_FRAME_INVALIDATION_AV1 0x40
+
+// If set in the video renderer capabilities field, PyroWave frames that lost packets FEC couldn't
+// recover are still delivered, with DECODE_UNIT.partialFrame set and BUFFER_TYPE_MISSING entries
+// where data is missing, rather than dropped. PyroWave frames stand alone and their blocks are
+// self-delimiting, so a decoder can use the blocks that arrived. A partial frame is delivered once
+// packets of a later frame arrive. This flag is only valid on video renderers.
+#define CAPABILITY_PARTIAL_FRAMES 0x80
 
 // If set in the video renderer capabilities field, this macro specifies that the renderer
 // supports slicing to increase decoding performance. The parameter specifies the desired
