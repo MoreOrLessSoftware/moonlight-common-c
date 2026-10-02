@@ -133,7 +133,8 @@ void destroyVideoDepacketizer(void);
 void queueRtpPacket(PRTPV_QUEUE_ENTRY queueEntry);
 bool partialFramesEnabled(void);
 void queuePartialFrame(PRTPV_QUEUE_ENTRY* shards, unsigned int shardCount, bool endsFrame, uint32_t frameIndex,
-                       uint64_t receiveTimeUs);
+                       uint64_t receiveTimeUs, bool late, int receivedPercent);
+bool getPartialFrameDeadline(int64_t* offsetUs, int* minReceivedPercent);
 void stopVideoDepacketizer(void);
 void requestDecoderRefresh(void);
 void notifyFrameLost(unsigned int frameNumber, bool speculative);

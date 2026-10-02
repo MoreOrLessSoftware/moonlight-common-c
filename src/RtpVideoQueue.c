@@ -537,13 +537,31 @@ static void submitCompletedFrame(PRTP_VIDEO_QUEUE queue) {
     }
 }
 
+// Roughly what percentage of the current frame's data packets have arrived. The current block
+// and those of the frame not started yet are taken to be the size of the latest one to start.
+// (Between blocks, the current block number is already the next one's.)
+static int estimateReceivedPercent(PRTP_VIDEO_QUEUE queue) {
+    bool pending = queue->pendingFecBlockList.count != 0;
+    unsigned int received = queue->completedFecBlockList.count + (pending ? queue->receivedDataPackets : 0);
+    unsigned int total = queue->completedFecBlockList.count +
+            (queue->multiFecLastBlockNumber - queue->multiFecCurrentBlockNumber + 1U) * queue->bufferDataPackets;
+
+    if (total == 0) {
+        return 0;
+    }
+    return (int)((uint64_t)received * 100 / total);
+}
+
 // When the current frame can't be completed, hands what arrived of it to the depacketizer as a
-// partial frame, if the renderer takes them (see CAPABILITY_PARTIAL_FRAMES). Returns true if it
-// did, having emptied both FEC block lists.
-static bool submitPartialFrame(PRTP_VIDEO_QUEUE queue) {
+// partial frame, if the renderer takes them (see CAPABILITY_PARTIAL_FRAMES). late says it is
+// being cut short at its deadline rather than having lost packets. Returns true if it did,
+// having emptied both FEC block lists.
+static bool submitPartialFrame(PRTP_VIDEO_QUEUE queue, bool late) {
     if (!partialFramesEnabled()) {
         return false;
     }
+
+    int receivedPercent = estimateReceivedPercent(queue);
 
     // Earlier FEC blocks of the frame that were completed, then what arrived of the current one
     unsigned int completedCount = queue->completedFecBlockList.count;
@@ -583,13 +601,49 @@ static bool submitPartialFrame(PRTP_VIDEO_QUEUE queue) {
     // Unless the current block is the frame's last, the rest of the frame never arrived
     bool endsFrame = pendingDataCount != 0 && queue->multiFecCurrentBlockNumber == queue->multiFecLastBlockNumber;
 
-    queuePartialFrame(shards, shardCount, endsFrame, queue->currentFrameNumber, receiveTimeUs);
+    queuePartialFrame(shards, shardCount, endsFrame, queue->currentFrameNumber, receiveTimeUs, late, receivedPercent);
     free(shards);
     return true;
 }
 
 uint32_t RtpvGetCurrentFrameNumber(PRTP_VIDEO_QUEUE queue) {
     return queue->currentFrameNumber;
+}
+
+// Returns true, with its deadline, while an unfinished frame may be cut short at one
+bool RtpvGetPartialFrameDeadline(PRTP_VIDEO_QUEUE queue, uint64_t* deadlineUs) {
+    if (!queue->partialDeadlineActive ||
+            (queue->pendingFecBlockList.count == 0 && queue->completedFecBlockList.count == 0)) {
+        return false;
+    }
+
+    *deadlineUs = queue->partialDeadlineUs;
+    return true;
+}
+
+// Once an unfinished frame reaches its deadline, delivers what has arrived of it as a partial
+// frame and moves on to the next one, so the rest of it is discarded as it arrives. A frame
+// with too little of it here yet is left to complete late instead, as it would have without
+// a deadline: missing that much, it would be dropped by the decoder or barely recognisable.
+void RtpvCheckPartialFrameDeadline(PRTP_VIDEO_QUEUE queue, uint64_t nowUs) {
+    uint64_t deadlineUs;
+
+    if (!RtpvGetPartialFrameDeadline(queue, &deadlineUs) || nowUs < deadlineUs) {
+        return;
+    }
+
+    // Judged once per frame
+    queue->partialDeadlineActive = false;
+
+    if (estimateReceivedPercent(queue) < queue->partialMinPercent) {
+        return;
+    }
+
+    if (submitPartialFrame(queue, true)) {
+        queue->currentFrameNumber++;
+        queue->multiFecCurrentBlockNumber = 0;
+        queue->reportedLostFrame = false;
+    }
 }
 
 int RtpvAddPacket(PRTP_VIDEO_QUEUE queue, PRTP_PACKET packet, int length, PRTPV_QUEUE_ENTRY packetEntry) {
@@ -669,7 +723,7 @@ int RtpvAddPacket(PRTP_VIDEO_QUEUE queue, PRTP_PACKET packet, int length, PRTPV_
                 // we must manually advance the queue to the next frame. Parsing this
                 // frame further is not possible.
                 if (queue->currentFrameNumber == nvPacket->frameIndex) {
-                    submittedPartialFrame = submitPartialFrame(queue);
+                    submittedPartialFrame = submitPartialFrame(queue, false);
 
                     // Discard any unsubmitted buffers from the previous frame
                     purgeListEntries(&queue->pendingFecBlockList);
@@ -699,7 +753,7 @@ int RtpvAddPacket(PRTP_VIDEO_QUEUE queue, PRTP_PACKET packet, int length, PRTPV_
 
         // Any other frame that can't be completed now
         if (abandoningFrame && !submittedPartialFrame) {
-            submittedPartialFrame = submitPartialFrame(queue);
+            submittedPartialFrame = submitPartialFrame(queue, false);
         }
 
         // We must either start on the current FEC block number for the current frame,
@@ -780,6 +834,23 @@ int RtpvAddPacket(PRTP_VIDEO_QUEUE queue, PRTP_PACKET packet, int length, PRTPV_
         queue->bufferHighestSequenceNumber = U16(queue->bufferFirstParitySequenceNumber + queue->bufferParityPackets - 1);
         queue->multiFecCurrentBlockNumber = fecCurrentBlockNumber;
         queue->multiFecLastBlockNumber = (nvPacket->multiFecBlocks >> 6) & 0x3;
+
+        // A new frame takes the deadline setting in force now. Its host timestamp is the
+        // presentationTimeUs it will be delivered with (see queuePacket()).
+        if (fecCurrentBlockNumber == 0) {
+            int64_t offsetUs;
+            int minPercent;
+
+            queue->partialDeadlineActive = false;
+            if (packet->timestamp != 0 && partialFramesEnabled() && getPartialFrameDeadline(&offsetUs, &minPercent)) {
+                int64_t deadlineUs = (int64_t)(((uint64_t)packet->timestamp * 1000) / PTS_DIVISOR) + offsetUs;
+                if (deadlineUs > 0) {
+                    queue->partialDeadlineActive = true;
+                    queue->partialDeadlineUs = (uint64_t)deadlineUs;
+                    queue->partialMinPercent = minPercent;
+                }
+            }
+        }
 
         queue->stats.packetCountVideo += queue->bufferDataPackets;
         queue->stats.packetCountFec += queue->bufferParityPackets;

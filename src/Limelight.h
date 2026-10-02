@@ -200,6 +200,12 @@ typedef struct _DECODE_UNIT {
     // chain holds what arrived, in frame order, with BUFFER_TYPE_MISSING entries for the rest.
     // The data after the last entry may also be missing.
     bool partialFrame;
+
+    // Only in partial frames: the frame was cut short at its deadline (see
+    // LiSetPartialFrameDeadline()) rather than having lost packets, and roughly what
+    // percentage of its data packets had arrived.
+    bool partialLate;
+    int partialPercent;
 } DECODE_UNIT, *PDECODE_UNIT;
 
 // Specifies that the audio stream should be encoded in stereo (default)
@@ -1044,6 +1050,16 @@ bool LiGetHdrMetadata(PSS_HDR_METADATA metadata);
 // framing: blocks in any order, padding records between them, and 4:2:0 chroma sited at the
 // center. Valid after the RTSP handshake. This is a Sunshine protocol extension.
 const char* LiGetHostPyroWaveBitstreamId(void);
+
+// Asks for frames still arriving at their deadline to be delivered as partial frames
+// then, rather than late (see CAPABILITY_PARTIAL_FRAMES, which this needs). A frame's
+// deadline is its presentationTimeUs plus offsetUs, on the LiGetMicroseconds() clock.
+// It is cut only if at least minReceivedPercent of its data packets have arrived;
+// otherwise it is delivered whenever it completes, as usual. The rest of a frame that
+// was cut is discarded as it arrives. Each frame takes the setting in force when its
+// first packet arrives. Call it with enabled false to stop. Safe to call from any
+// thread while the video stream is running.
+void LiSetPartialFrameDeadline(bool enabled, int64_t offsetUs, int minReceivedPercent);
 
 // This function requests an IDR frame from the host. Typically this is done using DR_NEED_IDR, but clients
 // processing frames asynchronously may need to reset their decoder state even after returning DR_OK for

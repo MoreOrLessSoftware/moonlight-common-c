@@ -47,6 +47,12 @@ typedef struct _RTP_VIDEO_QUEUE {
     uint64_t lastOosFramePresentationTimestamp;
     bool receivedOosData;
 
+    // When the current frame is cut short if it hasn't completed (see
+    // LiSetPartialFrameDeadline()), and how much of it must have arrived by then
+    bool partialDeadlineActive;
+    uint64_t partialDeadlineUs;
+    int partialMinPercent;
+
     RTP_VIDEO_STATS stats; // the above values are short-lived, this tracks stats for the life of the queue
 } RTP_VIDEO_QUEUE, *PRTP_VIDEO_QUEUE;
 
@@ -57,4 +63,6 @@ void RtpvInitializeQueue(PRTP_VIDEO_QUEUE queue);
 void RtpvCleanupQueue(PRTP_VIDEO_QUEUE queue);
 int RtpvAddPacket(PRTP_VIDEO_QUEUE queue, PRTP_PACKET packet, int length, PRTPV_QUEUE_ENTRY packetEntry);
 uint32_t RtpvGetCurrentFrameNumber(PRTP_VIDEO_QUEUE queue);
+bool RtpvGetPartialFrameDeadline(PRTP_VIDEO_QUEUE queue, uint64_t* deadlineUs);
+void RtpvCheckPartialFrameDeadline(PRTP_VIDEO_QUEUE queue, uint64_t nowUs);
 void RtpvSubmitQueuedPackets(PRTP_VIDEO_QUEUE queue);
