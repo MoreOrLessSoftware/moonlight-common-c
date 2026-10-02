@@ -34,6 +34,18 @@ static bool receivedFullFrame;
 // and subsequent packet/frame bursts that follow.
 #define RTP_RECV_PACKETS_BUFFERED 2048
 
+// How close to an unfinished frame's deadline the receive thread starts waking up for it
+// even when no packets arrive (see LiSetPartialFrameDeadline()). Further out, it relies on
+// the frame's own packets to wake it, which saves a poll() for every packet. A frame still
+// arriving at its deadline usually has packets arriving right up to it.
+#define PARTIAL_DEADLINE_POLL_WINDOW_US 2000
+
+// Set by LiSetPartialFrameDeadline() from the renderer, read by the receive thread
+static PLT_MUTEX partialDeadlineLock;
+static bool partialDeadlineEnabled;
+static int64_t partialDeadlineOffsetUs;
+static int partialDeadlineMinPercent;
+
 // Initialize the video stream
 void initializeVideoStream(void) {
     initializeVideoDepacketizer(StreamConfig.packetSize);
@@ -42,6 +54,10 @@ void initializeVideoStream(void) {
     receivedDataFromPeer = false;
     firstDataTimeMs = 0;
     receivedFullFrame = false;
+    PltCreateMutex(&partialDeadlineLock);
+    partialDeadlineEnabled = false;
+    partialDeadlineOffsetUs = 0;
+    partialDeadlineMinPercent = 0;
 }
 
 // Clean up the video stream
@@ -49,6 +65,48 @@ void destroyVideoStream(void) {
     PltDestroyCryptoContext(decryptionCtx);
     destroyVideoDepacketizer();
     RtpvCleanupQueue(&rtpQueue);
+    PltDeleteMutex(&partialDeadlineLock);
+}
+
+void LiSetPartialFrameDeadline(bool enabled, int64_t offsetUs, int minReceivedPercent) {
+    PltLockMutex(&partialDeadlineLock);
+    partialDeadlineEnabled = enabled;
+    partialDeadlineOffsetUs = offsetUs;
+    partialDeadlineMinPercent = minReceivedPercent;
+    PltUnlockMutex(&partialDeadlineLock);
+}
+
+bool getPartialFrameDeadline(int64_t* offsetUs, int* minReceivedPercent) {
+    bool enabled;
+
+    PltLockMutex(&partialDeadlineLock);
+    enabled = partialDeadlineEnabled;
+    *offsetUs = partialDeadlineOffsetUs;
+    *minReceivedPercent = partialDeadlineMinPercent;
+    PltUnlockMutex(&partialDeadlineLock);
+
+    return enabled;
+}
+
+// Cuts the current frame short if it has reached its deadline. Returns false if it is still
+// waiting for one less than PARTIAL_DEADLINE_POLL_WINDOW_US away, in which case untilDeadlineMs
+// says how long to wait for a packet before checking again.
+static bool checkPartialFrameDeadline(int* untilDeadlineMs) {
+    uint64_t deadlineUs, nowUs;
+
+    if (!RtpvGetPartialFrameDeadline(&rtpQueue, &deadlineUs)) {
+        return true;
+    }
+
+    nowUs = PltGetMicroseconds();
+    RtpvCheckPartialFrameDeadline(&rtpQueue, nowUs);
+
+    if (RtpvGetPartialFrameDeadline(&rtpQueue, &deadlineUs) && nowUs < deadlineUs &&
+            deadlineUs - nowUs <= PARTIAL_DEADLINE_POLL_WINDOW_US) {
+        *untilDeadlineMs = (int)((deadlineUs - nowUs + 999) / 1000);
+        return false;
+    }
+    return true;
 }
 
 // UDP Ping proc
@@ -131,6 +189,22 @@ static void VideoReceiveThreadProc(void* context) {
                 Limelog("Video Receive: malloc() failed\n");
                 ListenerCallbacks.connectionTerminated(-1);
                 break;
+            }
+        }
+
+        // Cut the current frame short if it has reached its deadline, and once it is close,
+        // wake up for the deadline even if no more packets come. This waits in select()
+        // rather than shortening the socket's receive timeout: on Windows, a recv() with a
+        // 1 ms SO_RCVTIMEO often went 10 ms without returning, then cut the frame that late.
+        int untilDeadlineMs;
+        if (!checkPartialFrameDeadline(&untilDeadlineMs)) {
+            struct pollfd pfd;
+
+            pfd.fd = rtpSocket;
+            pfd.events = POLLIN;
+            if (pollSockets(&pfd, 1, untilDeadlineMs) == 0) {
+                // Nothing arrived before the deadline
+                continue;
             }
         }
 

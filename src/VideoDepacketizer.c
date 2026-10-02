@@ -25,6 +25,8 @@ static uint32_t firstPacketRtpTimestamp;
 static bool dropStatePending;
 static bool idrFrameProcessed;
 static bool framePartial;
+static bool framePartialLate;
+static int framePartialPercent;
 
 #define DR_CLEANUP -1000
 
@@ -79,6 +81,8 @@ void initializeVideoDepacketizer(int pktSize) {
     dropStatePending = false;
     idrFrameProcessed = false;
     framePartial = false;
+    framePartialLate = false;
+    framePartialPercent = 0;
     strictIdrFrameWait = !isReferenceFrameInvalidationEnabled();
 }
 
@@ -501,6 +505,8 @@ static void reassembleFrame(int frameNumber, bool frameIsLTR) {
             qdu->decodeUnit.hdrActive = LiGetCurrentHostDisplayHdrMode();
             qdu->decodeUnit.colorspace = (uint8_t)(qdu->decodeUnit.hdrActive ? COLORSPACE_REC_2020 : StreamConfig.colorSpace);
             qdu->decodeUnit.partialFrame = framePartial;
+            qdu->decodeUnit.partialLate = framePartial && framePartialLate;
+            qdu->decodeUnit.partialPercent = framePartial ? framePartialPercent : 100;
 
             // Invoke the key frame callback if needed
             if (nalChainHead->bufferType != BUFFER_TYPE_PICDATA || qdu->decodeUnit.frameType == FRAME_TYPE_IDR) {
@@ -1176,10 +1182,11 @@ static bool queueMissing(int length) {
 
 // Called by the video RTP FEC queue with what arrived of a PyroWave frame it couldn't complete
 // (see CAPABILITY_PARTIAL_FRAMES). shards holds the frame's data packets in order, NULL for
-// each one lost, and endsFrame says whether the last of them is the frame's last packet. We
-// take ownership of every packet in shards.
+// each one lost, and endsFrame says whether the last of them is the frame's last packet. late
+// says it was cut short at its deadline rather than having lost packets, and receivedPercent
+// is about how much of it arrived. We take ownership of every packet in shards.
 void queuePartialFrame(PRTPV_QUEUE_ENTRY* shards, unsigned int shardCount, bool endsFrame, uint32_t frameIndex,
-                       uint64_t receiveTimeUs) {
+                       uint64_t receiveTimeUs, bool late, int receivedPercent) {
     const int payloadSize = StreamConfig.packetSize - (int)sizeof(NV_VIDEO_PACKET);
     uint16_t lastPayloadLength = 0;
     bool haveTimestamps = false;
@@ -1292,6 +1299,8 @@ void queuePartialFrame(PRTPV_QUEUE_ENTRY* shards, unsigned int shardCount, bool 
     dropStatePending = false;
 
     framePartial = true;
+    framePartialLate = late;
+    framePartialPercent = receivedPercent;
     reassembleFrame(frameIndex, false);
     framePartial = false;
 
