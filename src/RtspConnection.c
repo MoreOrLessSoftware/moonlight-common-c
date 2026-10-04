@@ -1122,8 +1122,14 @@ int performRtspHandshake(PSERVER_INFORMATION serverInfo) {
                                  hostPyroWaveBitstreamId, sizeof(hostPyroWaveBitstreamId));
 
         if ((StreamConfig.supportedVideoFormats & VIDEO_FORMAT_MASK_PYROWAVE) && strstr(response.payload, "PYROWAVE/90000")) {
-            if ((serverInfo->serverCodecModeSupport & SCM_PYROWAVE_10BIT) && (StreamConfig.supportedVideoFormats & VIDEO_FORMAT_PYROWAVE_10BIT)) {
+            if ((serverInfo->serverCodecModeSupport & SCM_PYROWAVE_10BIT_444) && (StreamConfig.supportedVideoFormats & VIDEO_FORMAT_PYROWAVE_10BIT_444)) {
+                NegotiatedVideoFormat = VIDEO_FORMAT_PYROWAVE_10BIT_444;
+            }
+            else if ((serverInfo->serverCodecModeSupport & SCM_PYROWAVE_10BIT) && (StreamConfig.supportedVideoFormats & VIDEO_FORMAT_PYROWAVE_10BIT)) {
                 NegotiatedVideoFormat = VIDEO_FORMAT_PYROWAVE_10BIT;
+            }
+            else if ((serverInfo->serverCodecModeSupport & SCM_PYROWAVE_444) && (StreamConfig.supportedVideoFormats & VIDEO_FORMAT_PYROWAVE_444)) {
+                NegotiatedVideoFormat = VIDEO_FORMAT_PYROWAVE_444;
             }
             else {
                 NegotiatedVideoFormat = VIDEO_FORMAT_PYROWAVE;
