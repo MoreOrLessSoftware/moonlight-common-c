@@ -100,6 +100,11 @@ typedef struct _STREAM_CONFIGURATION {
     // in /launch and /resume requests.
     char remoteInputAesKey[16];
     char remoteInputAesIv[16];
+
+    // The percentage of error correcting packets to ask Sunshine to add to each video
+    // frame, from 0 (none) to 255. LiInitializeStreamConfiguration() sets it to -1,
+    // which leaves it to the host's own setting. Other hosts ignore it.
+    int fecPercentage;
 } STREAM_CONFIGURATION, *PSTREAM_CONFIGURATION;
 
 // Use this function to zero the stream configuration when allocated on the stack or heap

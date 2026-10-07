@@ -126,6 +126,9 @@ bool isReferenceFrameInvalidationEnabled(void) {
 
 void LiInitializeStreamConfiguration(PSTREAM_CONFIGURATION streamConfig) {
     memset(streamConfig, 0, sizeof(*streamConfig));
+
+    // 0 would turn FEC off, so leave it to the host unless asked
+    streamConfig->fecPercentage = -1;
 }
 
 void LiInitializeVideoCallbacks(PDECODER_RENDERER_CALLBACKS drCallbacks) {

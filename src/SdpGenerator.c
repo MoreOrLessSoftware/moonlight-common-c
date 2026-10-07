@@ -385,6 +385,12 @@ static PSDP_OPTION getAttributesList(char*urlSafeAddr) {
     
     // FEC must be enabled for proper packet sequencing to be done by RTP FEC queue
     err |= addAttributeString(&optionHead, "x-nv-vqos[0].fec.enable", "1");
+
+    // Ask Sunshine for a FEC percentage of our own, if one was chosen
+    if (IS_SUNSHINE() && StreamConfig.fecPercentage >= 0 && StreamConfig.fecPercentage <= 255) {
+        snprintf(payloadStr, sizeof(payloadStr), "%d", StreamConfig.fecPercentage);
+        err |= addAttributeString(&optionHead, "x-ml-video.fecPercent", payloadStr);
+    }
     
     err |= addAttributeString(&optionHead, "x-nv-vqos[0].videoQualityScoreUpdateTime", "5000");
 
