@@ -53,6 +53,28 @@ typedef struct _SS_PING {
     uint32_t sequenceNumber;
 } SS_PING, *PSS_PING;
 
+// Clock sync with this fork's Sunshine, sent to the video port. The request starts like a
+// ping, so other hosts treat it as one. The reply's magic can't start an RTP version 2
+// packet, and the reply is shorter than any encrypted video packet, so it is told from video
+// without decrypting. Host times are microseconds since the zero point of the RTP video
+// timestamps, on the clock they come from. Fields are little-endian.
+#define SS_CLOCK_SYNC_REQUEST_MAGIC 0x53434C4D // "MLCS" in memory
+#define SS_CLOCK_SYNC_REPLY_MAGIC 0x4B434C4D // "MLCK" in memory
+typedef struct _SS_CLOCK_SYNC_REQUEST {
+    char payload[16]; // The video ping payload
+    uint32_t magic;
+    uint32_t sequence;
+    uint64_t clientSendUs;
+} SS_CLOCK_SYNC_REQUEST, *PSS_CLOCK_SYNC_REQUEST;
+
+typedef struct _SS_CLOCK_SYNC_REPLY {
+    uint32_t magic;
+    uint32_t sequence; // The request's
+    uint64_t clientSendUs; // The request's
+    uint64_t hostReceiveUs;
+    uint64_t hostSendUs;
+} SS_CLOCK_SYNC_REPLY, *PSS_CLOCK_SYNC_REPLY;
+
 // Fields are big-endian
 #define SS_FRAME_FEC_PTYPE 0x5502
 typedef struct _SS_FRAME_FEC_STATUS {

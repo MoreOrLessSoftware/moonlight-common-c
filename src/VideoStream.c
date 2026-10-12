@@ -47,6 +47,43 @@ static bool partialDeadlineEnabled;
 static int64_t partialDeadlineOffsetUs;
 static int partialDeadlineMinPercent;
 
+// Clock sync with this fork's Sunshine (see SS_CLOCK_SYNC_REQUEST). Requests go out from the
+// ping thread and replies come in on the receive thread, among the video packets.
+#define CLOCK_SYNC_INTERVAL_MS 50
+
+// The offset comes from the fastest of this many recent exchanges. Queueing and scheduling
+// only ever make an exchange slower, so the fastest is the least disturbed. At 50 ms apart
+// they span half a second, over which clocks 200 ppm apart drift 0.1 ms.
+#define CLOCK_SYNC_SAMPLES 10
+
+// Requests stop if none has been answered by then, as with any other host
+#define CLOCK_SYNC_GIVE_UP_MS 3000
+
+// Exchanges slower than this say nothing useful
+#define CLOCK_SYNC_MAX_RTT_US 1000000
+
+// Requests whose send times are kept to check replies against
+#define CLOCK_SYNC_SENT_SLOTS 16
+
+// RTP video timestamps are 32 bits at 90 kHz, so presentationTimeUs wraps after this long
+#define RTP_TIMESTAMP_PERIOD_US (4294967296.0 * 1000.0 / 90.0)
+
+typedef struct _CLOCK_SYNC_SAMPLE {
+    int64_t rttUs;
+    int64_t offsetUs; // The host's clock minus ours
+    uint64_t hostUs; // When the host received the request
+} CLOCK_SYNC_SAMPLE;
+
+static PLT_MUTEX clockSyncLock;
+static CLOCK_SYNC_SAMPLE clockSyncSamples[CLOCK_SYNC_SAMPLES];
+static int clockSyncSampleCount;
+static int clockSyncNextSample;
+static bool clockSyncValid;
+static int64_t clockSyncOffsetUs;
+static uint64_t clockSyncHostUs;
+static uint32_t clockSyncSentSequence[CLOCK_SYNC_SENT_SLOTS];
+static uint64_t clockSyncSentUs[CLOCK_SYNC_SENT_SLOTS];
+
 // Initialize the video stream
 void initializeVideoStream(void) {
     initializeVideoDepacketizer(StreamConfig.packetSize);
@@ -59,6 +96,14 @@ void initializeVideoStream(void) {
     partialDeadlineEnabled = false;
     partialDeadlineOffsetUs = 0;
     partialDeadlineMinPercent = 0;
+    PltCreateMutex(&clockSyncLock);
+    clockSyncSampleCount = 0;
+    clockSyncNextSample = 0;
+    clockSyncValid = false;
+    clockSyncOffsetUs = 0;
+    clockSyncHostUs = 0;
+    memset(clockSyncSentSequence, 0, sizeof(clockSyncSentSequence));
+    memset(clockSyncSentUs, 0, sizeof(clockSyncSentUs));
 }
 
 // Clean up the video stream
@@ -67,6 +112,125 @@ void destroyVideoStream(void) {
     destroyVideoDepacketizer();
     RtpvCleanupQueue(&rtpQueue);
     PltDeleteMutex(&partialDeadlineLock);
+    PltDeleteMutex(&clockSyncLock);
+}
+
+static void sendClockSyncRequest(LC_SOCKADDR* saddr, uint32_t sequence) {
+    SS_CLOCK_SYNC_REQUEST request;
+    uint64_t nowUs;
+
+    memcpy(request.payload, VideoPingPayload.payload, sizeof(request.payload));
+    request.magic = LE32(SS_CLOCK_SYNC_REQUEST_MAGIC);
+    request.sequence = LE32(sequence);
+
+    nowUs = PltGetMicroseconds();
+    request.clientSendUs = LE64(nowUs);
+
+    PltLockMutex(&clockSyncLock);
+    clockSyncSentSequence[sequence % CLOCK_SYNC_SENT_SLOTS] = sequence;
+    clockSyncSentUs[sequence % CLOCK_SYNC_SENT_SLOTS] = nowUs;
+    PltUnlockMutex(&clockSyncLock);
+
+    sendto(rtpSocket, (char*)&request, sizeof(request), 0, (struct sockaddr*)saddr, AddrLen);
+}
+
+static bool isClockSyncAnswered(void) {
+    bool valid;
+
+    PltLockMutex(&clockSyncLock);
+    valid = clockSyncValid;
+    PltUnlockMutex(&clockSyncLock);
+
+    return valid;
+}
+
+// receivedUs is when the reply came off the socket
+static void handleClockSyncReply(PSS_CLOCK_SYNC_REPLY reply, uint64_t receivedUs) {
+    uint32_t sequence = LE32(reply->sequence);
+    uint64_t clientSendUs = LE64(reply->clientSendUs);
+    uint64_t hostReceiveUs = LE64(reply->hostReceiveUs);
+    uint64_t hostSendUs = LE64(reply->hostSendUs);
+    int slot = sequence % CLOCK_SYNC_SENT_SLOTS;
+    int64_t rttUs, offsetUs;
+    bool first;
+    int i;
+
+    PltLockMutex(&clockSyncLock);
+
+    // Only an answer to a request of ours, once. An off-path sender can't know the send
+    // time it has to echo.
+    if (clientSendUs == 0 || clockSyncSentSequence[slot] != sequence || clockSyncSentUs[slot] != clientSendUs) {
+        PltUnlockMutex(&clockSyncLock);
+        return;
+    }
+    clockSyncSentUs[slot] = 0;
+
+    rttUs = ((int64_t)receivedUs - (int64_t)clientSendUs) - ((int64_t)hostSendUs - (int64_t)hostReceiveUs);
+    if (rttUs < 0 || rttUs > CLOCK_SYNC_MAX_RTT_US || hostSendUs < hostReceiveUs) {
+        PltUnlockMutex(&clockSyncLock);
+        return;
+    }
+
+    // The midpoints of the two legs, assuming they take as long as each other
+    offsetUs = (((int64_t)hostReceiveUs - (int64_t)clientSendUs) + ((int64_t)hostSendUs - (int64_t)receivedUs)) / 2;
+
+    clockSyncSamples[clockSyncNextSample].rttUs = rttUs;
+    clockSyncSamples[clockSyncNextSample].offsetUs = offsetUs;
+    clockSyncSamples[clockSyncNextSample].hostUs = hostReceiveUs;
+    clockSyncNextSample = (clockSyncNextSample + 1) % CLOCK_SYNC_SAMPLES;
+    if (clockSyncSampleCount < CLOCK_SYNC_SAMPLES) {
+        clockSyncSampleCount++;
+    }
+
+    {
+        int best = 0;
+        for (i = 1; i < clockSyncSampleCount; i++) {
+            if (clockSyncSamples[i].rttUs < clockSyncSamples[best].rttUs) {
+                best = i;
+            }
+        }
+        clockSyncOffsetUs = clockSyncSamples[best].offsetUs;
+        clockSyncHostUs = clockSyncSamples[best].hostUs;
+    }
+
+    first = !clockSyncValid;
+    clockSyncValid = true;
+
+    PltUnlockMutex(&clockSyncLock);
+
+    if (first) {
+        Limelog("Clock sync: host answered, round trip %d us\n", (int)rttUs);
+    }
+}
+
+bool LiGetHostTimeOnLocalClock(uint64_t presentationTimeUs, uint64_t* localTimeUs) {
+    int64_t offsetUs;
+    uint64_t hostUs;
+    double periods;
+    int64_t wraps;
+    int64_t hostTimeUs;
+
+    PltLockMutex(&clockSyncLock);
+    if (!clockSyncValid) {
+        PltUnlockMutex(&clockSyncLock);
+        return false;
+    }
+    offsetUs = clockSyncOffsetUs;
+    hostUs = clockSyncHostUs;
+    PltUnlockMutex(&clockSyncLock);
+
+    // presentationTimeUs wraps with the RTP timestamp, while the host's sync times don't, so
+    // take the wrap that puts the frame nearest the latest sync
+    periods = ((double)hostUs - (double)presentationTimeUs) / RTP_TIMESTAMP_PERIOD_US;
+    wraps = periods >= 0 ? (int64_t)(periods + 0.5) : -(int64_t)(0.5 - periods);
+    hostTimeUs = (int64_t)presentationTimeUs + (int64_t)((double)wraps * RTP_TIMESTAMP_PERIOD_US);
+
+    if (hostTimeUs - offsetUs < 0) {
+        return false;
+    }
+
+    *localTimeUs = (uint64_t)(hostTimeUs - offsetUs);
+    return true;
 }
 
 void LiSetPartialFrameDeadline(bool enabled, int64_t offsetUs, int minReceivedPercent) {
@@ -122,18 +286,49 @@ static void VideoPingThreadProc(void* context) {
     // issues related to receiving ICMP port unreachable messages due
     // to sending a packet prior to the host PC binding to that port.
     int pingCount = 0;
+    bool pinged = false;
+    uint64_t lastPingMs = 0;
+    uint32_t clockSyncSequence = 0;
+    uint64_t clockSyncStartMs = 0;
+    bool clockSyncGaveUp = false;
     while (!PltIsThreadInterrupted(&udpPingThread)) {
-        if (VideoPingPayload.payload[0] != 0) {
-            pingCount++;
-            VideoPingPayload.sequenceNumber = BE32(pingCount);
+        uint64_t nowMs = PltGetMillis();
+        bool clockSyncing;
 
-            sendto(rtpSocket, (char*)&VideoPingPayload, sizeof(VideoPingPayload), 0, (struct sockaddr*)&saddr, AddrLen);
-        }
-        else {
-            sendto(rtpSocket, legacyPingData, sizeof(legacyPingData), 0, (struct sockaddr*)&saddr, AddrLen);
+        if (!pinged || nowMs - lastPingMs >= 500) {
+            if (VideoPingPayload.payload[0] != 0) {
+                pingCount++;
+                VideoPingPayload.sequenceNumber = BE32(pingCount);
+
+                sendto(rtpSocket, (char*)&VideoPingPayload, sizeof(VideoPingPayload), 0, (struct sockaddr*)&saddr, AddrLen);
+            }
+            else {
+                sendto(rtpSocket, legacyPingData, sizeof(legacyPingData), 0, (struct sockaddr*)&saddr, AddrLen);
+            }
+
+            pinged = true;
+            lastPingMs = nowMs;
         }
 
-        PltSleepMsInterruptible(&udpPingThread, 500);
+        // Clock sync starts once video arrives, by when the host knows where to answer.
+        // Hosts other than this fork's Sunshine never answer, and then it stops.
+        clockSyncing = IS_SUNSHINE() && VideoPingPayload.payload[0] != 0 && !clockSyncGaveUp;
+        if (clockSyncing && receivedDataFromPeer) {
+            if (clockSyncStartMs == 0) {
+                clockSyncStartMs = nowMs;
+            }
+
+            if (!isClockSyncAnswered() && nowMs - clockSyncStartMs >= CLOCK_SYNC_GIVE_UP_MS) {
+                Limelog("Clock sync: no answer from the host, so it is not supported\n");
+                clockSyncGaveUp = true;
+                clockSyncing = false;
+            }
+            else {
+                sendClockSyncRequest(&saddr, ++clockSyncSequence);
+            }
+        }
+
+        PltSleepMsInterruptible(&udpPingThread, clockSyncing ? CLOCK_SYNC_INTERVAL_MS : 500);
     }
 }
 
@@ -251,6 +446,17 @@ static void VideoReceiveThreadProc(void* context) {
 
             // Receive timed out; try again
             continue;
+        }
+
+        // A clock sync reply, which can't be a video packet (see SS_CLOCK_SYNC_REPLY)
+        if (err == sizeof(SS_CLOCK_SYNC_REPLY)) {
+            uint64_t receivedUs = PltGetMicroseconds();
+            PSS_CLOCK_SYNC_REPLY reply = (PSS_CLOCK_SYNC_REPLY)(encrypted ? encryptedBuffer : buffer);
+
+            if (LE32(reply->magic) == SS_CLOCK_SYNC_REPLY_MAGIC) {
+                handleClockSyncReply(reply, receivedUs);
+                continue;
+            }
         }
 
         // Every packet counts, including FEC, duplicates, and packets of frames that are

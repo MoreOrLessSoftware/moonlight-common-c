@@ -1067,6 +1067,14 @@ const char* LiGetHostPyroWaveBitstreamId(void);
 // thread while the video stream is running.
 void LiSetPartialFrameDeadline(bool enabled, int64_t offsetUs, int minReceivedPercent);
 
+// Converts a frame's presentationTimeUs, the host's capture time, to the LiGetMicroseconds()
+// clock. This needs clock sync, which only this fork's Sunshine answers: the offset between
+// the clocks is measured NTP-style over the video socket, from the fastest of the most recent
+// exchanges, to within half of any asymmetry in the network path. Returns false when the host
+// doesn't answer clock sync or hasn't yet. Safe to call from any thread while the video stream
+// is running. This is a Sunshine protocol extension.
+bool LiGetHostTimeOnLocalClock(uint64_t presentationTimeUs, uint64_t* localTimeUs);
+
 // This function requests an IDR frame from the host. Typically this is done using DR_NEED_IDR, but clients
 // processing frames asynchronously may need to reset their decoder state even after returning DR_OK for
 // the prior frame. Rather than wait for a new frame and return DR_NEED_IDR for that one, they can just
