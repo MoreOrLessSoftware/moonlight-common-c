@@ -26,6 +26,7 @@ static bool dropStatePending;
 static bool idrFrameProcessed;
 static bool framePartial;
 static bool framePartialLate;
+static bool framePartialRecords;
 static int framePartialPercent;
 
 #define DR_CLEANUP -1000
@@ -82,6 +83,7 @@ void initializeVideoDepacketizer(int pktSize) {
     idrFrameProcessed = false;
     framePartial = false;
     framePartialLate = false;
+    framePartialRecords = false;
     framePartialPercent = 0;
     strictIdrFrameWait = !isReferenceFrameInvalidationEnabled();
 }
@@ -507,6 +509,7 @@ static void reassembleFrame(int frameNumber, bool frameIsLTR) {
             qdu->decodeUnit.partialFrame = framePartial;
             qdu->decodeUnit.partialLate = framePartial && framePartialLate;
             qdu->decodeUnit.partialPercent = framePartial ? framePartialPercent : 100;
+            qdu->decodeUnit.partialRecords = framePartial && framePartialRecords;
 
             // Invoke the key frame callback if needed
             if (nalChainHead->bufferType != BUFFER_TYPE_PICDATA || qdu->decodeUnit.frameType == FRAME_TYPE_IDR) {
@@ -1185,10 +1188,20 @@ static bool queueMissing(int length) {
 // each one lost, and endsFrame says whether the last of them is the frame's last packet. late
 // says it was cut short at its deadline rather than having lost packets, and receivedPercent
 // is about how much of it arrived. We take ownership of every packet in shards.
+//
+// Hosts that lay a frame's records out on its packets (record framing) announce in the frame
+// header how many leading packets hold the sequence header and the coarsest wavelet level.
+// Without those the frame can't be decoded, so it's only delivered if they all arrived. They
+// flag the packets that start with a record, which are marked BUFFER_TYPE_RECORD_START for the
+// decoder to resume parsing at after a lost record header, as their records needn't be in block
+// order. Other frames have their blocks in order. Either way, a frame whose first packet was lost
+// is dropped: it can't be told which it is, and it can't be decoded without its sequence header.
 void queuePartialFrame(PRTPV_QUEUE_ENTRY* shards, unsigned int shardCount, bool endsFrame, uint32_t frameIndex,
                        uint64_t receiveTimeUs, bool late, int receivedPercent) {
     const int payloadSize = StreamConfig.packetSize - (int)sizeof(NV_VIDEO_PACKET);
     uint16_t lastPayloadLength = 0;
+    uint16_t criticalPackets = 0;
+    unsigned int firstLost = shardCount;
     bool haveTimestamps = false;
     bool haveData = false;
     bool ok = true;
@@ -1215,6 +1228,9 @@ void queuePartialFrame(PRTPV_QUEUE_ENTRY* shards, unsigned int shardCount, bool 
         PRTPV_QUEUE_ENTRY queueEntryPtr = shards[i];
 
         if (queueEntryPtr == NULL) {
+            if (firstLost == shardCount) {
+                firstLost = i;
+            }
             if (ok) {
                 ok = queueMissing(i == 0 ? payloadSize - (int)frameHeaderSize : payloadSize);
             }
@@ -1260,6 +1276,11 @@ void queuePartialFrame(PRTPV_QUEUE_ENTRY* shards, unsigned int shardCount, bool 
             BbGet16(&bb, &frameHostProcessingLatency);
             BbInitializeWrappedBuffer(&bb, data, 4, 2, BYTE_ORDER_LITTLE);
             BbGet16(&bb, &lastPayloadLength);
+            if (data[0] == 0x01) {
+                // The critical packet count, in the last two bytes of the short frame header
+                BbInitializeWrappedBuffer(&bb, data, 6, 2, BYTE_ORDER_LITTLE);
+                BbGet16(&bb, &criticalPackets);
+            }
             if (data[0] == (char)0x81) {
                 frameHeaderSize = 44;
             }
@@ -1278,10 +1299,17 @@ void queuePartialFrame(PRTPV_QUEUE_ENTRY* shards, unsigned int shardCount, bool 
         if (ok && length > 0) {
             queueFragment(&existingEntry, data, offset, length);
             haveData = true;
+            if (criticalPackets != 0 && i > 0 && (nvPacket->extraFlags & NV_VIDEO_PACKET_EXTRA_FLAG_PYROWAVE_RECORD_START)) {
+                nalChainTail->bufferType = BUFFER_TYPE_RECORD_START;
+            }
         }
         if (existingEntry != NULL) {
             free(existingEntry->allocPtr);
         }
+    }
+
+    if (firstLost == 0 || criticalPackets > firstLost) {
+        ok = false;
     }
 
     if (!ok || !haveData) {
@@ -1301,6 +1329,7 @@ void queuePartialFrame(PRTPV_QUEUE_ENTRY* shards, unsigned int shardCount, bool 
     framePartial = true;
     framePartialLate = late;
     framePartialPercent = receivedPercent;
+    framePartialRecords = criticalPackets != 0;
     reassembleFrame(frameIndex, false);
     framePartial = false;
 
