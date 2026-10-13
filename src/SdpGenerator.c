@@ -440,8 +440,9 @@ static PSDP_OPTION getAttributesList(char*urlSafeAddr) {
         if (NegotiatedVideoFormat & VIDEO_FORMAT_MASK_PYROWAVE) {
             err |= addAttributeString(&optionHead, "x-nv-vqos[0].bitStreamFormat", "3");
 
-            // Record framing, which the nonary (vibeshine) host otherwise replaces with a
-            // length-prefixed framing we don't parse. This fork's Sunshine ignores it.
+            // Record framing, which hosts lay out on packets so a frame that lost some can still
+            // be decoded. The nonary (vibeshine) host otherwise sends a length-prefixed framing
+            // we don't parse.
             err |= addAttributeString(&optionHead, "x-ss-video[0].pyrowaveFeatures", "1");
         }
         else if (NegotiatedVideoFormat & VIDEO_FORMAT_MASK_AV1) {
