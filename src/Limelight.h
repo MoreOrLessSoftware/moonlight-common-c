@@ -122,6 +122,11 @@ void LiInitializeStreamConfiguration(PSTREAM_CONFIGURATION streamConfig);
 // arrive. The entry's data is NULL.
 #define BUFFER_TYPE_MISSING  0x04
 
+// Only in partial PyroWave frames in record framing (see DECODE_UNIT.partialRecords): picture data
+// from a packet the host flagged as starting with a record, where parsing can resume after a lost
+// record header. Never the first entry, since the frame itself starts with a record.
+#define BUFFER_TYPE_RECORD_START 0x05
+
 typedef struct _LENTRY {
     // Pointer to the next entry or NULL if this is the last entry
     struct _LENTRY* next;
@@ -211,6 +216,12 @@ typedef struct _DECODE_UNIT {
     // percentage of its data packets had arrived.
     bool partialLate;
     int partialPercent;
+
+    // Only in partial PyroWave frames: the host laid the frame's records out on its packets
+    // (record framing), and the packets holding its sequence header and coarsest wavelet level all
+    // arrived. Its records may be in any order, and BUFFER_TYPE_RECORD_START entries mark where
+    // they start. Otherwise its blocks are in order.
+    bool partialRecords;
 } DECODE_UNIT, *PDECODE_UNIT;
 
 // Specifies that the audio stream should be encoded in stereo (default)
@@ -305,7 +316,9 @@ typedef struct _DECODE_UNIT {
 // recover are still delivered, with DECODE_UNIT.partialFrame set and BUFFER_TYPE_MISSING entries
 // where data is missing, rather than dropped. PyroWave frames stand alone and their blocks are
 // self-delimiting, so a decoder can use the blocks that arrived. A partial frame is delivered once
-// packets of a later frame arrive. This flag is only valid on video renderers.
+// packets of a later frame arrive. A frame laid out in record framing is only delivered if the
+// packets the host announced as holding the coarsest wavelet level arrived (see
+// DECODE_UNIT.partialRecords). This flag is only valid on video renderers.
 #define CAPABILITY_PARTIAL_FRAMES 0x80
 
 // If set in the video renderer capabilities field, this macro specifies that the renderer
@@ -1052,9 +1065,8 @@ bool LiGetHdrMetadata(PSS_HDR_METADATA metadata);
 
 // Returns the PyroWave bitstream revision the host advertised in its RTSP DESCRIBE response
 // (x-ss-pyrowave.bitstream), or an empty string if it sent none. The nonary (vibeshine) host
-// sends it; this fork's Sunshine doesn't. Hosts that send it pack PyroWave frames in record
-// framing: blocks in any order, padding records between them, and 4:2:0 chroma sited at the
-// center. Valid after the RTSP handshake. This is a Sunshine protocol extension.
+// sends it; this fork's Sunshine doesn't. Hosts that send it site 4:2:0 chroma at the center.
+// Valid after the RTSP handshake. This is a Sunshine protocol extension.
 const char* LiGetHostPyroWaveBitstreamId(void);
 
 // Asks for frames still arriving at their deadline to be delivered as partial frames
